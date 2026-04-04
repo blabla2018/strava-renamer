@@ -15,6 +15,12 @@ def test_trainer_ride_is_rejected():
     assert "trainer" in decision.reason
 
 
+def test_commute_ride_is_rejected():
+    decision = asyncio.run(evaluate_activity_filters({"sport_type": "Ride", "trainer": False, "commute": True}))
+    assert not decision.accepted
+    assert "commute" in decision.reason
+
+
 def test_outdoor_ride_is_accepted():
     decision = asyncio.run(evaluate_activity_filters({"sport_type": "Ride", "trainer": False}))
     assert decision.accepted

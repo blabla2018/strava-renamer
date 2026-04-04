@@ -16,6 +16,7 @@ async def evaluate_activity_filters(
 ) -> FilterDecision:
     sport_type = str(activity.get("sport_type") or activity.get("type") or "").strip()
     trainer = bool(activity.get("trainer"))
+    commute = bool(activity.get("commute"))
 
     if sport_type in {"VirtualRide", "VirtualRun"}:
         return FilterDecision(False, "virtual activity is excluded")
@@ -25,5 +26,8 @@ async def evaluate_activity_filters(
 
     if trainer:
         return FilterDecision(False, "trainer / indoor ride is excluded")
+
+    if commute:
+        return FilterDecision(False, "commute ride is excluded")
 
     return FilterDecision(True, "outdoor ride accepted")

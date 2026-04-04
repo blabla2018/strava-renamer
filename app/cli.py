@@ -12,6 +12,7 @@ from app.db import Database
 from app.eval_tools import evaluate_dataset, fetch_eval_dataset, parse_iso_date, prewarm_dataset, write_json
 from app.geocoding import GeoClient
 from app.pipeline import ActivityPipeline
+from app.recent_activity_sync import RecentActivitySync
 from app.strava import StravaClient
 
 
@@ -39,6 +40,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Include full route diagnostics such as raw signals and clusters.",
+    )
+
+    sync_parser = subparsers.add_parser(
+        "sync-recent-activities",
+        help="Fetch recent athlete activities and rename eligible outdoor rides locally.",
+    )
+    sync_parser.add_argument(
+        "--days",
+        type=int,
+        default=3,
+        help="How many trailing days to inspect. Defaults to 3.",
+    )
+    sync_parser.add_argument(
+        "--per-page",
+        type=int,
+        default=100,
+        help="Page size for GET /athlete/activities. Defaults to 100.",
+    )
+    sync_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually send generated titles back to Strava. Without this flag the command is dry-run only.",
     )
 
     fetch_eval_parser = subparsers.add_parser(
@@ -93,6 +116,31 @@ async def _inspect_activity(activity_id: int, owner_id: Optional[int], apply_upd
             indent=2,
         )
     )
+    return 0
+
+
+async def _sync_recent_activities(days: int, per_page: int, apply_update: bool) -> int:
+    settings = load_settings()
+    db = Database(settings.db_path)
+    db.init()
+    db.seed_tokens(settings)
+
+    strava_client = StravaClient(settings, db)
+    geo_client = GeoClient(settings, db)
+    pipeline = ActivityPipeline(settings, db, strava_client, geo_client)
+    sync = RecentActivitySync(settings, strava_client, pipeline)
+
+    try:
+        report = await sync.sync_recent_activities(
+            days=days,
+            apply_update=apply_update,
+            per_page=per_page,
+        )
+    finally:
+        await strava_client.close()
+        await geo_client.close()
+
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -346,6 +394,8 @@ def main() -> int:
 
     if args.command == "inspect-activity":
         return asyncio.run(_inspect_activity(args.activity_id, args.owner_id, args.apply, args.verbose))
+    if args.command == "sync-recent-activities":
+        return asyncio.run(_sync_recent_activities(args.days, args.per_page, args.apply))
     if args.command == "fetch-eval-dataset":
         return asyncio.run(
             _fetch_eval_dataset(
