@@ -48,13 +48,7 @@ class GeoClient:
             self._cache_put(cache_key, "nominatim", data)
         address = data.get("address", {})
 
-        locality = (
-            address.get("city")
-            or address.get("town")
-            or address.get("municipality")
-            or address.get("county")
-            or address.get("village")
-        )
+        locality = _pick_locality(data, address)
         district = address.get("city_district") or address.get("district") or address.get("county")
         suburb = address.get("suburb") or address.get("neighbourhood") or address.get("quarter")
         road = address.get("road") or address.get("pedestrian") or address.get("path")
@@ -77,7 +71,6 @@ class GeoClient:
             road=road,
             raw_rank=raw_rank,
         )
-
     async def detect_turnaround_poi(self, point: Point, radius_m: int = 1200) -> Optional[DetectedLandmark]:
         query = f"""
         [out:json][timeout:18];
@@ -284,3 +277,33 @@ def json_dumps_stable(payload: Dict[str, Any]) -> str:
     import json
 
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _pick_locality(data: Dict[str, Any], address: Dict[str, Any]) -> Optional[str]:
+    addresstype = str(data.get("addresstype") or "").lower()
+    name = str(data.get("name") or "").strip() or None
+
+    if addresstype == "village":
+        return address.get("village") or name or address.get("town") or address.get("city")
+
+    if addresstype in {"hamlet", "isolated_dwelling"}:
+        return (
+            address.get("town")
+            or address.get("municipality")
+            or address.get("city")
+            or address.get(addresstype)
+            or address.get("village")
+            or address.get("hamlet")
+            or name
+        )
+
+    return (
+        address.get("city")
+        or address.get("town")
+        or address.get("municipality")
+        or address.get("village")
+        or address.get("hamlet")
+        or address.get("isolated_dwelling")
+        or address.get("suburb")
+        or address.get("county")
+    )

@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 
+from app.athlete_profile import AthleteProfile
 from app.config import Settings
 from app.db import Database
 
@@ -24,6 +25,7 @@ class StravaClient:
         self.db = db
         self.http_client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
         self._segment_cache: Dict[int, Dict[str, Any]] = {}
+        self._athlete_profile_cache: Optional[AthleteProfile] = None
 
     async def close(self) -> None:
         await self.http_client.aclose()
@@ -65,6 +67,25 @@ class StravaClient:
         if before is not None:
             params["before"] = before
         return await self._request_json_list("GET", "/api/v3/athlete/activities", params=params)
+
+    async def get_authenticated_athlete_profile(self) -> Optional[AthleteProfile]:
+        if self._athlete_profile_cache is not None:
+            return self._athlete_profile_cache
+
+        cached_payload = self.db.get_athlete_profile_cache()
+        if cached_payload is not None:
+            self._athlete_profile_cache = AthleteProfile.from_strava_payload(cached_payload)
+            return self._athlete_profile_cache
+
+        if self.settings.strava_cache_only:
+            return None
+
+        payload = await self._request_json("GET", "/api/v3/athlete")
+        profile = AthleteProfile.from_strava_payload(payload)
+        if profile.athlete_id is not None:
+            self.db.put_athlete_profile_cache(profile.athlete_id, payload)
+        self._athlete_profile_cache = profile
+        return profile
 
     async def get_segments(self, segment_ids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
         ids = [segment_id for segment_id in dict.fromkeys(int(value) for value in segment_ids) if segment_id > 0]

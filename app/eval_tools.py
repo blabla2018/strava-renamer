@@ -121,6 +121,8 @@ async def evaluate_dataset(
             expected_title=expected,
             generated_title=generated,
             current_name=str(activity.get("name") or ""),
+            accepted_titles=item.get("accepted_titles") or [],
+            review_comment=item.get("review_comment"),
             route_summary=result.route_summary,
         )
         total += 1
@@ -177,9 +179,14 @@ def build_eval_row(
     expected_title: str,
     generated_title: str,
     current_name: str,
+    accepted_titles,
+    review_comment: Optional[str],
     route_summary,
 ) -> Dict[str, Any]:
-    normalized_expected = normalize_title(expected_title)
+    comparison_titles = [expected_title] + [str(title or "") for title in (accepted_titles or [])]
+    comparison_titles = list(dict.fromkeys(comparison_titles))
+    best_reference = _best_matching_title(generated_title, comparison_titles)
+    normalized_expected = normalize_title(best_reference)
     normalized_generated = normalize_title(generated_title)
     expected_tokens = set(normalized_expected.split())
     generated_tokens = set(normalized_generated.split())
@@ -189,9 +196,12 @@ def build_eval_row(
     return {
         "activity_id": activity_id,
         "expected_title": expected_title,
+        "accepted_titles": list(accepted_titles or []),
+        "matched_reference_title": best_reference,
         "generated_title": generated_title,
         "current_name": current_name,
-        "exact_match": expected_title == generated_title,
+        "review_comment": review_comment,
+        "exact_match": generated_title in comparison_titles,
         "normalized_exact_match": normalized_expected == normalized_generated,
         "similarity": round(similarity, 4),
         "token_jaccard": round(token_jaccard, 4),
@@ -205,6 +215,20 @@ def build_eval_row(
             for item in (route_summary.ordered_highlights if route_summary else [])
         ][:4],
     }
+
+
+def _best_matching_title(generated_title: str, comparison_titles: List[str]) -> str:
+    if not comparison_titles:
+        return ""
+    normalized_generated = normalize_title(generated_title)
+
+    def score(title: str) -> tuple[int, float]:
+        normalized_title = normalize_title(title)
+        exact = int(normalized_title == normalized_generated)
+        similarity = SequenceMatcher(a=normalized_title, b=normalized_generated).ratio()
+        return exact, similarity
+
+    return max(comparison_titles, key=score)
 
 
 def normalize_title(value: str) -> str:

@@ -8,10 +8,12 @@ import httpx
 import math
 
 from app.activity_filters import FilterDecision, evaluate_activity_filters
+from app.athlete_profile import AthleteProfile
 from app.config import Settings
 from app.db import Database
 from app.geocoding import GeoClient
-from app.naming import NamingDecision, generate_title, should_rename_activity
+from app.naming import NamingDecision, generate_title
+from app.rename_policy import should_rename_activity
 from app.route_analysis import (
     OrderedHighlight,
     Point,
@@ -119,22 +121,16 @@ class ActivityPipeline:
         summary.raw_signals = limit_raw_signals(sorted(raw_signals, key=lambda item: (item.position, -item.score)), 50)
         summary.clusters = limit_clusters(clusters, 20)
         summary.ordered_highlights = ordered_highlights
-        naming_decision = generate_title(summary)
+        athlete_profile: Optional[AthleteProfile] = await self.strava_client.get_authenticated_athlete_profile()
+        naming_decision = generate_title(summary, athlete_profile=athlete_profile)
         previous_audit = self.db.get_last_rename_audit(activity_id)
         should_rename, rename_reason = should_rename_activity(
             current_name=current_name,
             decision=naming_decision,
             sport_type=sport_type,
             settings=self.settings,
+            previous_generated_name=previous_audit["generated_name"] if previous_audit is not None else None,
         )
-        if (
-            should_rename
-            and previous_audit is not None
-            and previous_audit["generated_name"]
-            and not self.settings.overwrite_existing_generated_titles
-        ):
-            should_rename = False
-            rename_reason = "existing generated title will not be overwritten by configuration"
 
         updated = False
         if should_rename and apply_update:
@@ -378,9 +374,8 @@ def build_ordered_highlights(clusters: List[RouteEntityCluster], limit: int) -> 
     for cluster in sorted(clusters, key=lambda item: item.position_centroid):
         if not _cluster_is_meaningful(cluster):
             continue
-        if selected and abs(cluster.position_centroid - selected[-1].position_centroid) < 0.08:
-            if cluster.score > selected[-1].score:
-                selected[-1] = cluster
+        if selected and abs(cluster.position_centroid - selected[-1].position_centroid) < 0.05:
+            selected[-1] = _preferred_nearby_cluster(selected[-1], cluster)
             continue
         selected.append(cluster)
 
@@ -388,17 +383,21 @@ def build_ordered_highlights(clusters: List[RouteEntityCluster], limit: int) -> 
     for cluster in selected:
         replacement_index: Optional[int] = None
         for index, existing in enumerate(deduped_selected):
-            if existing.normalized_name != cluster.normalized_name:
-                continue
             if abs(existing.position_centroid - cluster.position_centroid) > 0.35:
                 continue
-            replacement_index = index
-            break
+            if existing.normalized_name == cluster.normalized_name:
+                replacement_index = index
+                break
+            if _cluster_names_share_anchor(existing.normalized_name, cluster.normalized_name):
+                replacement_index = index
+                break
         if replacement_index is None:
             deduped_selected.append(cluster)
             continue
-        if cluster.score > deduped_selected[replacement_index].score:
-            deduped_selected[replacement_index] = cluster
+        deduped_selected[replacement_index] = _preferred_overlapping_cluster(
+            deduped_selected[replacement_index],
+            cluster,
+        )
 
     ranked = sorted(deduped_selected, key=lambda item: (-item.score, item.position_centroid))
     trimmed = sorted(ranked[:limit], key=lambda item: item.position_centroid)
@@ -639,13 +638,6 @@ def _clean_signal_name(value: str) -> str:
     cleaned = re.sub(r"(?i)\bde\s+una\b", " ", cleaned)
     cleaned = re.sub(r"(?i)\bcruce\b", " ", cleaned)
     cleaned = re.sub(r"(?i)\bcartel\b", " ", cleaned)
-    cleaned = re.sub(r"(?i)\bcanteras\b", " ", cleaned)
-    cleaned = re.sub(r"(?i)\bchaparral\b", " Chaparral ", cleaned)
-    cleaned = re.sub(r"(?i)\bgarbi\b", " Garbi ", cleaned)
-    cleaned = re.sub(r"(?i)\boronet\b", " Oronet ", cleaned)
-    cleaned = re.sub(r"(?i)\bl[’']?oronet\b", " Oronet ", cleaned)
-    cleaned = re.sub(r"(?i)\bel\s+garb[ií]\b", " Garbi ", cleaned)
-    cleaned = re.sub(r"(?i)\bserra\b", " ", cleaned)
     cleaned = re.sub(r"(?i)\bhg\b|\bdn\b", " ", cleaned)
     cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9/+ -]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -/")
@@ -665,20 +657,42 @@ def _signals_belong_to_same_cluster(signal: RawRouteSignal, cluster: List[RawRou
 
 
 def _name_overlap(a: str, b: str) -> bool:
-    tokens_a = set(a.split())
-    tokens_b = set(b.split())
+    tokens_a = set(_overlap_tokens(a))
+    tokens_b = set(_overlap_tokens(b))
     if not tokens_a or not tokens_b:
         return False
     intersection = tokens_a & tokens_b
-    return len(intersection) >= max(1, min(len(tokens_a), len(tokens_b)) // 2)
+    if len(intersection) >= max(1, min(len(tokens_a), len(tokens_b)) // 2):
+        return True
+    # Keep short aliases like "Cullera" and "Cullera Saler" grouped together.
+    return len(intersection) >= 1 and min(len(tokens_a), len(tokens_b)) == 1
+
+
+def _overlap_tokens(value: str) -> List[str]:
+    stopwords = {
+        "de", "del", "dels", "la", "el", "l", "les", "los", "las", "y", "i",
+        "port", "puerto", "via", "vía",
+    }
+    return [token for token in value.split() if token and token not in stopwords]
 
 
 def _pick_canonical_cluster_name(signals: List[RawRouteSignal]) -> str:
-    preferred_label = _preferred_known_cluster_label(signals)
-    if preferred_label is not None:
-        return preferred_label
+    locality_candidates = []
+    for signal in signals:
+        if signal.kind != "turnaround_place":
+            continue
+        cleaned = _clean_signal_name(signal.name)
+        if not cleaned:
+            continue
+        tokens = _meaningful_tokens(cleaned)
+        display = _display_name_from_tokens(tokens) if tokens else cleaned
+        if display:
+            locality_candidates.append(display)
+    if locality_candidates:
+        locality_candidates.sort(key=lambda value: (len(_normalize_signal_name(value).split()), len(value), value.lower()))
+        return locality_candidates[0]
 
-    candidates: List[tuple] = []
+    candidates: dict[str, dict] = {}
     for signal in signals:
         cleaned = _clean_signal_name(signal.name)
         for alias in [cleaned] + [_clean_signal_name(alias) for alias in signal.aliases]:
@@ -693,44 +707,32 @@ def _pick_canonical_cluster_name(signals: List[RawRouteSignal]) -> str:
             score = signal.score - penalty + min(1.2, len(meaningful_tokens) * 0.25)
             if len(display) <= 2:
                 score -= 2.0
-            candidates.append((score, len(display), display))
+            key = display.lower()
+            if key not in candidates:
+                candidates[key] = {
+                    "display": display,
+                    "support": 0,
+                    "best_score": 0.0,
+                    "score_total": 0.0,
+                    "token_count": len(display.split(" - ")) if " - " in display else len(display.split()),
+                }
+            candidates[key]["support"] += 1
+            candidates[key]["best_score"] = max(candidates[key]["best_score"], signal.score)
+            candidates[key]["score_total"] += score
 
     if not candidates:
         fallback = max(signals, key=lambda item: (item.score, len(item.name))).name
         return _clean_signal_name(fallback) or fallback
 
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
-    top_names = [item[2] for item in candidates[:12]]
-
-    if any("Oronet" == name for name in top_names) and any("Garbi" == name for name in top_names):
-        return "Oronet - Garbi"
-    return top_names[0]
-
-
-def _preferred_known_cluster_label(signals: List[RawRouteSignal]) -> Optional[str]:
-    bag = " ".join(
-        _normalize_signal_name(part)
-        for signal in signals
-        for part in [signal.name] + list(signal.aliases)
-        if part
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (
+            -(item["support"] * 2.0 + item["best_score"] + min(1.5, item["token_count"] * 0.5) + min(2.0, item["score_total"] * 0.05)),
+            len(item["display"]),
+            item["display"].lower(),
+        ),
     )
-    if not bag:
-        return None
-
-    tokens = set(bag.split())
-    if {"oronet", "garbi"} <= tokens:
-        return "Oronet - Garbi"
-    if {"sa", "calobra"} <= tokens or "calobra" in tokens:
-        return "Sa Calobra"
-    if "formentor" in tokens:
-        return "Formentor"
-    if "oronet" in tokens:
-        return "Oronet"
-    if "garbi" in tokens:
-        return "Garbi"
-    if "cullera" in tokens:
-        return "Cullera"
-    return None
+    return ranked[0]["display"]
 
 
 def _noisy_name_penalty(value: str) -> float:
@@ -750,9 +752,12 @@ def _noisy_name_penalty(value: str) -> float:
 def _meaningful_tokens(value: str) -> List[str]:
     raw_tokens = [token for token in re.split(r"[\s/+,-]+", value) if token]
     stopwords = {
-        "de", "del", "la", "el", "l", "les", "los", "las", "y", "i",
-        "hasta", "todo", "tot", "una", "en", "al", "a",
-        "port", "puerto", "coll", "mirador", "faro",
+        "de", "del", "dels", "la", "el", "l", "les", "los", "las", "y", "i",
+        "hasta", "todo", "tot", "una", "en", "al", "a", "desde", "por",
+        "port", "puerto", "coll", "mirador", "faro", "via", "vía", "camino", "cami",
+        "calle", "carrer", "carretera", "servici", "servicio",
+        "crono", "climb", "este", "per", "juto", "full", "test", "mdp", "pico", "subida",
+        "sprint", "segmento", "rot", "rotonda", "rtda",
     }
     result = []
     for token in raw_tokens:
@@ -761,7 +766,9 @@ def _meaningful_tokens(value: str) -> List[str]:
             continue
         if clean.lower() in stopwords:
             continue
-        if len(clean) <= 2 and clean.lower() not in {"or", "sa"}:
+        if clean.isdigit():
+            continue
+        if len(clean) <= 3 and clean.lower() not in {"sa"}:
             continue
         result.append(clean)
     return result
@@ -779,8 +786,10 @@ def _display_name_from_tokens(tokens: List[str]) -> str:
         normalized.append(text)
     if not normalized:
         return ""
-    if "Oronet" in normalized and "Garbi" in normalized:
-        return "Oronet - Garbi"
+    if len(normalized) >= 2 and len(normalized[0]) <= 2:
+        joined = f"{normalized[0]} {normalized[1]}"
+        if len(joined) <= 22:
+            return joined
     if len(normalized) >= 2 and normalized[0] != normalized[1]:
         joined = " - ".join(normalized[:2])
         if len(joined) <= 22:
@@ -801,6 +810,54 @@ def _pick_cluster_kind(signals: List[RawRouteSignal]) -> str:
         "segment": 1,
     }
     return max(signals, key=lambda item: priority.get(item.kind, 0)).kind
+
+
+def _preferred_nearby_cluster(existing: RouteEntityCluster, candidate: RouteEntityCluster) -> RouteEntityCluster:
+    existing_priority = _nearby_cluster_priority(existing)
+    candidate_priority = _nearby_cluster_priority(candidate)
+    if candidate_priority != existing_priority:
+        return candidate if candidate_priority > existing_priority else existing
+    if candidate.score != existing.score:
+        return candidate if candidate.score > existing.score else existing
+    if len(candidate.canonical_name) != len(existing.canonical_name):
+        return candidate if len(candidate.canonical_name) < len(existing.canonical_name) else existing
+    return candidate if candidate.cluster_id > existing.cluster_id else existing
+
+
+def _preferred_overlapping_cluster(existing: RouteEntityCluster, candidate: RouteEntityCluster) -> RouteEntityCluster:
+    if _cluster_name_subsumes(existing.normalized_name, candidate.normalized_name):
+        existing_tokens = _overlap_tokens(existing.normalized_name)
+        candidate_tokens = _overlap_tokens(candidate.normalized_name)
+        if len(existing_tokens) != len(candidate_tokens):
+            return existing if len(existing_tokens) < len(candidate_tokens) else candidate
+    return _preferred_nearby_cluster(existing, candidate)
+
+
+def _cluster_names_share_anchor(first: str, second: str) -> bool:
+    return _cluster_name_subsumes(first, second)
+
+
+def _cluster_name_subsumes(first: str, second: str) -> bool:
+    first_tokens = set(_overlap_tokens(first))
+    second_tokens = set(_overlap_tokens(second))
+    if not first_tokens or not second_tokens:
+        return False
+    return first_tokens <= second_tokens or second_tokens <= first_tokens
+
+
+def _nearby_cluster_priority(cluster: RouteEntityCluster) -> int:
+    priority = {
+        "mountain_pass": 6,
+        "peak": 6,
+        "lighthouse": 6,
+        "turnaround_place": 5,
+        "climb_segment": 4,
+        "viewpoint": 3,
+        "attraction": 2,
+        "monument": 2,
+        "segment": 1,
+    }
+    return priority.get(cluster.kind, 0)
 
 
 def _cluster_is_meaningful(cluster: RouteEntityCluster) -> bool:

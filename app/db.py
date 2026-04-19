@@ -79,6 +79,12 @@ class Database:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS strava_athlete_profile_cache (
+                    athlete_id INTEGER PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -234,6 +240,37 @@ class Database:
                 """,
                 (activity_id,),
             ).fetchone()
+
+    def get_athlete_profile_cache(self) -> Optional[Dict[str, Any]]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json
+                FROM strava_athlete_profile_cache
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(str(row["payload_json"]))
+
+    def put_athlete_profile_cache(self, athlete_id: int, payload: Dict[str, Any]) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO strava_athlete_profile_cache (athlete_id, payload_json, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(athlete_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    athlete_id,
+                    json.dumps(payload),
+                    _utcnow().isoformat(),
+                ),
+            )
 
     def record_rename_audit(
         self,
